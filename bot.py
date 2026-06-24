@@ -20,7 +20,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Load environment variables - SECURITY: Never hardcode tokens!
-DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
+DISCORD_TOKEN = os.getenv('DISCORD_TOKEN', '')
 if not DISCORD_TOKEN:
     raise ValueError("DISCORD_TOKEN environment variable is required! Set it in .env file or environment.")
 
