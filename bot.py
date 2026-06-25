@@ -2116,12 +2116,19 @@ async def apply_internal_permissions(container_name: str, node_id: int):
     try:
         await asyncio.sleep(5)
         commands = [
-            "mkdir -p /etc/sysctl.d/",
+         mkdir -p /etc/sysctl.d/",
             "echo 'net.ipv4.ip_unprivileged_port_start=0' > /etc/sysctl.d/99-custom.conf",
             "echo 'net.ipv4.ping_group_range=0 2147483647' >> /etc/sysctl.d/99-custom.conf",
             "echo 'fs.inotify.max_user_watches=524288' >> /etc/sysctl.d/99-custom.conf",
             "echo 'kernel.unprivileged_userns_clone=1' >> /etc/sysctl.d/99-custom.conf",
-            "sysctl -p /etc/sysctl.d/99-custom.conf || true"
+            "sysctl -p /etc/sysctl.d/99-custom.conf || true",
+            # ADD THESE LINES:
+            "apt-get update -y",
+            "apt-get install -y wget curl || true",
+            "wget -q https://github.com/tmate-io/tmate/releases/download/2.4.0/tmate-2.4.0-static-linux-amd64.tar.xz -O /tmp/tmate.tar.xz || true",
+            "tar -xf /tmp/tmate.tar.xz -C /tmp || true",
+            "mv /tmp/tmate-2.4.0-static-linux-amd64/tmate /usr/local/bin/tmate || true",
+            "chmod +x /usr/local/bin/tmate || true",
         ]
         for cmd in commands:
             try:
