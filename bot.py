@@ -2116,7 +2116,7 @@ async def apply_internal_permissions(container_name: str, node_id: int):
     try:
         await asyncio.sleep(5)
         commands = [
-         mkdir -p /etc/sysctl.d/",
+            "mkdir -p /etc/sysctl.d/",
             "echo 'net.ipv4.ip_unprivileged_port_start=0' > /etc/sysctl.d/99-custom.conf",
             "echo 'net.ipv4.ping_group_range=0 2147483647' >> /etc/sysctl.d/99-custom.conf",
             "echo 'fs.inotify.max_user_watches=524288' >> /etc/sysctl.d/99-custom.conf",
