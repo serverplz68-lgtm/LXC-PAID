@@ -36,7 +36,7 @@ VPS_USER_ROLE_ID = int(os.getenv('VPS_USER_ROLE_ID', '1210291131301101618'))
 DEFAULT_STORAGE_POOL = os.getenv('DEFAULT_STORAGE_POOL', 'default')
 HOST_MOTD = os.getenv('HOST_MOTD', 'bash <(curl -fsSL https://raw.githubusercontent.com/hopingboyz/linux/main/atyro-water-mark.sh)')
 BOT_VERSION = os.getenv('BOT_VERSION', '8.0-PRO')
-BOT_DEVELOPER = os.getenv('BOT_DEVELOPER', 'Hopingboz')
+BOT_DEVELOPER = os.getenv('BOT_DEVELOPER', 'AashirwadGamerzz')
 BOT_THUMBNAIL_URL = os.getenv('BOT_THUMBNAIL_URL', 'https://i.imgur.com/Tv3clt0.jpeg')
 BOT_ICON_URL = os.getenv('BOT_ICON_URL', 'https://i.imgur.com/Tv3clt0.jpeg')
 
@@ -438,6 +438,49 @@ def init_db():
                 )
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_sshx_container ON sshx_sessions(container_name)")
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS appeals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    container_name TEXT NOT NULL,
+                    owner_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    suspension_reason TEXT,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    admin_id TEXT,
+                    admin_note TEXT,
+                    messages TEXT DEFAULT '[]',
+                    created_ts INTEGER NOT NULL,
+                    resolved_ts INTEGER
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_appeals_container ON appeals(container_name)")
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS live_panels (
+                    message_id INTEGER PRIMARY KEY,
+                    channel_id INTEGER NOT NULL,
+                    owner_id TEXT NOT NULL,
+                    admin_view INTEGER NOT NULL DEFAULT 0,
+                    created_ts INTEGER NOT NULL
+                )
+            """)
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS installers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    url TEXT NOT NULL,
+                    description TEXT NOT NULL DEFAULT '',
+                    category TEXT NOT NULL DEFAULT 'General',
+                    version TEXT NOT NULL DEFAULT '',
+                    added_by TEXT,
+                    created_ts INTEGER NOT NULL,
+                    updated_ts INTEGER NOT NULL
+                )
+            """)
+            cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_installers_name ON installers(lower(name))")
 
             # Create table for fraud detection - track user IPs and device fingerprints
             cur.execute("""
@@ -1221,7 +1264,7 @@ RAM_THRESHOLD = int(get_setting('ram_threshold', 90))
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
-bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
+bot = commands.Bot(command_prefix=commands.when_mentioned_or(PREFIX), intents=intents, help_command=None)
 
 # Resource monitoring settings (logging only)
 resource_monitor_active = True
@@ -1348,7 +1391,7 @@ def create_embed(title, description="", color=COLOR_PRIMARY):
     )
     embed.set_thumbnail(url=BOT_THUMBNAIL_URL)
     embed.set_footer(
-        text=f"Made by Hopingboyz • v{BOT_VERSION} • {datetime.now().strftime('%H:%M:%S')}",
+        text=f"Made by AashirwadGamerzz • v{BOT_VERSION} • {datetime.now().strftime('%H:%M:%S')}",
         icon_url=BOT_ICON_URL
     )
     embed.timestamp = datetime.now()
@@ -2134,6 +2177,18 @@ async def on_ready():
         bot.loop.create_task(sshx_expiry_task())
         bot.sshx_task_started = True
 
+    # Buttons that must keep working after a restart (appeal review + live status panels)
+    if not getattr(bot, 'persistent_views_added', False):
+        bot.add_view(AppealReviewView())
+        bot.add_view(StatusPanelView())
+        bot.persistent_views_added = True
+
+    # Live !vpsstatus panels (refresh every 60 seconds)
+    if not getattr(bot, 'status_loop_started', False):
+        restore_status_panels()
+        bot.loop.create_task(vps_status_loop())
+        bot.status_loop_started = True
+
     # Start auto-save background task (only once)
     if not any(task.get_name() == 'auto_save_task' for task in asyncio.all_tasks()):
         bot.loop.create_task(auto_save_task())
@@ -2326,7 +2381,7 @@ async def my_vps(ctx):
             inline=False
         )
 
-    embed.set_footer(text=f"Made by Hopingboyz • VPS Control Panel")
+    embed.set_footer(text=f"Made by AashirwadGamerzz • VPS Control Panel")
     embed.timestamp = ctx.message.created_at
 
     await ctx.send(embed=embed)
@@ -4256,6 +4311,1008 @@ class FileManagerView(discord.ui.View):
         await self.refresh_now()
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# ADMIN / LOOKUP HELPERS + SMALL DB HELPERS
+# ═══════════════════════════════════════════════════════════════════════════
+
+APPEAL_CHANNEL_ID = int(os.getenv('APPEAL_CHANNEL_ID', '0') or 0)          # optional: post appeals here instead of DMs
+APPEAL_COOLDOWN_HOURS = int(os.getenv('APPEAL_COOLDOWN_HOURS', '6'))       # wait time after a rejected appeal
+VPSSTATUS_INTERVAL = 60                                                    # seconds between live status updates
+STATUS_PAGE_SIZE = 12                                                      # VPS per page in !vpsstatus
+
+
+def is_admin_id(user_id) -> bool:
+    return str(user_id) == str(MAIN_ADMIN_ID) or str(user_id) in [str(x) for x in admin_data.get("admins", [])]
+
+
+def all_admin_ids() -> List[str]:
+    ids = [str(MAIN_ADMIN_ID)] + [str(x) for x in admin_data.get("admins", [])]
+    return list(dict.fromkeys(ids))
+
+
+def find_vps(container_name: str):
+    """Return (owner_id, vps_dict) or (None, None)."""
+    for uid, lst in vps_data.items():
+        for v in lst:
+            if v.get("container_name") == container_name:
+                return uid, v
+    return None, None
+
+
+def _db_run(sql: str, params=()):
+    """Run a write statement. Returns (lastrowid, rowcount)."""
+    with DB_LOCK:
+        conn = get_db()
+        try:
+            cur = conn.execute(sql, params)
+            conn.commit()
+            return cur.lastrowid, cur.rowcount
+        finally:
+            conn.close()
+
+
+def _db_one(sql: str, params=()):
+    with DB_LOCK:
+        conn = get_db()
+        try:
+            row = conn.execute(sql, params).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+
+def _db_all(sql: str, params=()):
+    with DB_LOCK:
+        conn = get_db()
+        try:
+            return [dict(r) for r in conn.execute(sql, params).fetchall()]
+        finally:
+            conn.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SUSPENSION APPEALS
+# ═══════════════════════════════════════════════════════════════════════════
+
+def appeal_create(container, owner_id, user_id, reason, susp_reason) -> int:
+    return _db_run(
+        """INSERT INTO appeals (container_name, owner_id, user_id, reason, suspension_reason, status, messages, created_ts)
+           VALUES (?, ?, ?, ?, ?, 'pending', '[]', ?)""",
+        (container, str(owner_id), str(user_id), reason, susp_reason, int(time.time())))[0]
+
+
+def appeal_get(appeal_id: int):
+    return _db_one("SELECT * FROM appeals WHERE id = ?", (int(appeal_id),))
+
+
+def appeal_pending(container: str):
+    return _db_one("SELECT * FROM appeals WHERE container_name = ? AND status = 'pending' ORDER BY id DESC LIMIT 1", (container,))
+
+
+def appeal_last_rejected(container: str):
+    return _db_one("SELECT * FROM appeals WHERE container_name = ? AND status = 'rejected' ORDER BY resolved_ts DESC LIMIT 1", (container,))
+
+
+def appeal_claim(appeal_id: int, status: str, admin_id, note) -> bool:
+    """Atomically move pending -> approved/rejected. False if somebody else got there first."""
+    return _db_run(
+        "UPDATE appeals SET status = ?, admin_id = ?, admin_note = ?, resolved_ts = ? WHERE id = ? AND status = 'pending'",
+        (status, str(admin_id), note, int(time.time()), int(appeal_id)))[1] > 0
+
+
+def appeal_reopen(appeal_id: int):
+    _db_run("UPDATE appeals SET status = 'pending', admin_id = NULL, admin_note = NULL, resolved_ts = NULL WHERE id = ?", (int(appeal_id),))
+
+
+def appeal_set_messages(appeal_id: int, refs):
+    _db_run("UPDATE appeals SET messages = ? WHERE id = ?", (json.dumps(refs), int(appeal_id)))
+
+
+def _last_suspension_reason(vps: Dict[str, Any]) -> str:
+    history = vps.get("suspension_history") or []
+    for h in reversed(history):
+        reason = str(h.get("reason", ""))
+        if not reason.startswith("✅"):
+            return reason or "No reason recorded"
+    return "No reason recorded"
+
+
+async def unsuspend_vps_core(container_name: str, note: str, by: str):
+    """Same effect as !unsuspend-vps: start the container and clear the suspended flag."""
+    owner_id, vps = find_vps(container_name)
+    if not vps:
+        return False, "VPS not found."
+    node_id = vps.get("node_id", 1)
+    try:
+        await execute_lxc(container_name, f"start {container_name}", node_id=node_id)
+    except Exception as e:
+        if "already running" not in str(e).lower():
+            return False, short_error(str(e))
+    vps["suspended"] = False
+    vps["status"] = "running"
+    vps.setdefault("suspension_history", []).append(
+        {"time": datetime.now().isoformat(), "reason": f"✅ {note}", "by": by})
+    try:
+        await apply_internal_permissions(container_name, node_id)
+        await recreate_port_forwards(container_name)
+    except Exception as e:
+        logger.warning(f"Post-unsuspend setup for {container_name} had an issue: {e}")
+    save_vps_data_immediate()
+    return True, "OK"
+
+
+def build_appeal_embed(a: Dict[str, Any], vps: Optional[Dict[str, Any]]) -> discord.Embed:
+    embed = discord.Embed(
+        title="📨 VPS Suspension Appeal",
+        description=f"<@{a['user_id']}> is asking for `{a['container_name']}` to be unsuspended.",
+        color=COLOR_WARNING,
+    )
+    embed.add_field(name="🖥️ VPS", value=f"`{a['container_name']}`\nOwner: <@{a['owner_id']}>", inline=True)
+    embed.add_field(name="⛔ Suspended because", value=truncate_text(a.get("suspension_reason") or "No reason recorded", 1000), inline=True)
+    embed.add_field(name="💬 User's appeal", value=truncate_text(a["reason"], 1000), inline=False)
+    if vps and vps.get("expiration_date"):
+        try:
+            exp = datetime.fromisoformat(vps["expiration_date"])
+            if exp < datetime.now():
+                embed.add_field(
+                    name="⚠️ Expired VPS",
+                    value=f"Expired {exp.strftime('%Y-%m-%d')}. Approving will NOT extend it — renew it too (`{PREFIX}renew-vps`) "
+                          "or the expiry monitor will suspend it again.", inline=False)
+        except ValueError:
+            pass
+    embed.add_field(name="🕒 Submitted", value=f"<t:{a['created_ts']}:R>", inline=True)
+    embed.set_footer(text=f"Appeal #{a['id']}")
+    return embed
+
+
+async def _edit_appeal_messages(a: Dict[str, Any], status: str, admin_user, note: Optional[str]):
+    try:
+        refs = json.loads(a.get("messages") or "[]")
+    except (TypeError, ValueError):
+        refs = []
+    approved = status == "approved"
+    for cid, mid in refs:
+        try:
+            ch = bot.get_channel(int(cid)) or await bot.fetch_channel(int(cid))
+            msg = await ch.fetch_message(int(mid))
+            if not msg.embeds:
+                continue
+            e = msg.embeds[0]
+            e.color = COLOR_SUCCESS if approved else COLOR_ERROR
+            e.add_field(
+                name="✅ Approved — VPS unsuspended" if approved else "❌ Rejected — VPS stays suspended",
+                value=f"By {admin_user.mention}" + (f"\nNote: {truncate_text(note, 500)}" if note else ""),
+                inline=False)
+            await msg.edit(embed=e, view=None)
+        except Exception as e:
+            logger.debug(f"Could not update appeal message {cid}/{mid}: {e}")
+
+
+async def resolve_appeal(appeal_id: int, approve: bool, admin_user, note: Optional[str] = None):
+    """Approve (unsuspend) or reject (stay suspended). Returns (ok, message)."""
+    a = appeal_get(appeal_id)
+    if not a:
+        return False, "Appeal not found."
+    if a["status"] != "pending":
+        return False, f"Appeal #{appeal_id} was already **{a['status']}**."
+    owner_id, vps = find_vps(a["container_name"])
+    if not vps:
+        appeal_claim(appeal_id, "rejected", admin_user.id, "VPS no longer exists")
+        await _edit_appeal_messages(appeal_get(appeal_id), "rejected", admin_user, "VPS no longer exists")
+        return False, "That VPS no longer exists, so the appeal was closed."
+
+    status = "approved" if approve else "rejected"
+    if not appeal_claim(appeal_id, status, admin_user.id, note):
+        return False, f"Appeal #{appeal_id} was already handled by another admin."
+
+    warning = ""
+    if approve:
+        if vps.get("suspended"):
+            ok, err = await unsuspend_vps_core(a["container_name"], f"Appeal #{appeal_id} approved by {admin_user.name}", f"{admin_user.name} ({admin_user.id})")
+            if not ok:
+                appeal_reopen(appeal_id)          # let an admin retry
+                return False, f"Could not unsuspend the VPS: {err}"
+        if vps.get("expiration_date"):
+            try:
+                if datetime.fromisoformat(vps["expiration_date"]) < datetime.now():
+                    warning = f"\n⚠️ This VPS is past its expiration date; renew it with `{PREFIX}renew-vps` or it will be suspended again."
+            except ValueError:
+                pass
+
+    final = appeal_get(appeal_id)
+    await _edit_appeal_messages(final, status, admin_user, note)
+    try:
+        user = await bot.fetch_user(int(a["user_id"]))
+        if approve:
+            await user.send(embed=create_success_embed(
+                "✅ Appeal Approved", f"Your appeal for `{a['container_name']}` was approved. The VPS is unsuspended and running again."))
+        else:
+            await user.send(embed=create_error_embed(
+                "❌ Appeal Rejected",
+                f"Your appeal for `{a['container_name']}` was rejected — the VPS stays suspended."
+                + (f"\n\n**Admin note:** {truncate_text(note, 800)}" if note else "")
+                + (f"\n\nYou can appeal again in {APPEAL_COOLDOWN_HOURS} hour(s)." if APPEAL_COOLDOWN_HOURS else "")))
+    except Exception as e:
+        logger.debug(f"Could not DM appeal result to {a['user_id']}: {e}")
+    return True, ("Appeal approved — VPS unsuspended." if approve else "Appeal rejected — VPS stays suspended.") + warning
+
+
+async def notify_admins_of_appeal(appeal_id: int) -> int:
+    """Send the appeal (with Approve / Reject buttons) to the appeals channel or every admin's DMs."""
+    a = appeal_get(appeal_id)
+    if not a:
+        return 0
+    _, vps = find_vps(a["container_name"])
+    embed = build_appeal_embed(a, vps)
+    targets = []
+    if APPEAL_CHANNEL_ID:
+        try:
+            targets.append(bot.get_channel(APPEAL_CHANNEL_ID) or await bot.fetch_channel(APPEAL_CHANNEL_ID))
+        except Exception as e:
+            logger.warning(f"Appeal channel {APPEAL_CHANNEL_ID} unavailable: {e}")
+    if not targets:
+        for uid in all_admin_ids():
+            try:
+                targets.append(await bot.fetch_user(int(uid)))
+            except Exception as e:
+                logger.warning(f"Could not look up admin {uid}: {e}")
+    refs = []
+    for t in targets:
+        try:
+            msg = await t.send(embed=embed, view=AppealReviewView())
+            refs.append([msg.channel.id, msg.id])
+        except Exception as e:
+            logger.warning(f"Could not deliver appeal #{appeal_id}: {e}")
+    appeal_set_messages(appeal_id, refs)
+    return len(refs)
+
+
+def _appeal_id_from_message(message: discord.Message) -> Optional[int]:
+    if message and message.embeds and message.embeds[0].footer and message.embeds[0].footer.text:
+        m = re.search(r"Appeal #(\d+)", message.embeds[0].footer.text)
+        if m:
+            return int(m.group(1))
+    return None
+
+
+class AppealModal(discord.ui.Modal, title="Appeal VPS suspension"):
+    appeal_text = discord.ui.TextInput(
+        label="Why should this VPS be unsuspended?",
+        style=discord.TextStyle.paragraph,
+        placeholder="Explain what happened and why it won't happen again.",
+        min_length=10, max_length=900, required=True,
+    )
+
+    def __init__(self, container_name: str, user_id: int):
+        super().__init__(timeout=600)
+        self.container_name = container_name
+        self.user_id = user_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        owner_id, vps = find_vps(self.container_name)
+        if not vps or str(owner_id) != str(self.user_id):
+            await interaction.followup.send(embed=create_error_embed("VPS Not Found", "This VPS no longer exists."), ephemeral=True)
+            return
+        if not vps.get("suspended"):
+            await interaction.followup.send(embed=create_info_embed("Not Suspended", "This VPS is not suspended — no appeal needed."), ephemeral=True)
+            return
+        pending = appeal_pending(self.container_name)
+        if pending:
+            await interaction.followup.send(embed=create_info_embed(
+                "Appeal Already Pending", f"Appeal #{pending['id']} was sent <t:{pending['created_ts']}:R>. Please wait for an admin to review it."), ephemeral=True)
+            return
+        last = appeal_last_rejected(self.container_name)
+        if last and last.get("resolved_ts"):
+            until = last["resolved_ts"] + APPEAL_COOLDOWN_HOURS * 3600
+            if until > time.time():
+                await interaction.followup.send(embed=create_warning_embed(
+                    "Please Wait", f"Your last appeal was rejected. You can appeal again <t:{int(until)}:R>."), ephemeral=True)
+                return
+
+        aid = appeal_create(self.container_name, owner_id, interaction.user.id, self.appeal_text.value.strip(), _last_suspension_reason(vps))
+        delivered = await notify_admins_of_appeal(aid)
+        if delivered:
+            await interaction.followup.send(embed=create_success_embed(
+                "📨 Appeal Sent", f"Appeal #{aid} was sent to the admins. You'll get a DM with their decision.\nThe VPS stays suspended until then."), ephemeral=True)
+        else:
+            await interaction.followup.send(embed=create_warning_embed(
+                "Appeal Saved", f"Appeal #{aid} was saved, but I couldn't reach any admin right now. Please contact an admin directly."), ephemeral=True)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        logger.error(f"AppealModal error: {error}", exc_info=True)
+
+
+class AppealRejectModal(discord.ui.Modal, title="Reject appeal"):
+    note = discord.ui.TextInput(
+        label="Reason (shown to the user, optional)", style=discord.TextStyle.paragraph,
+        required=False, max_length=500)
+
+    def __init__(self, appeal_id: int):
+        super().__init__(timeout=300)
+        self.appeal_id = appeal_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not is_admin_id(interaction.user.id):
+            await interaction.response.send_message("Only admins can do this.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        ok, msg = await resolve_appeal(self.appeal_id, False, interaction.user, (self.note.value or "").strip() or None)
+        await interaction.followup.send(embed=(create_success_embed if ok else create_error_embed)("Appeal Rejected" if ok else "Could not reject", msg), ephemeral=True)
+
+
+class AppealReviewView(discord.ui.View):
+    """Persistent (survives restarts): the appeal id is read from the embed footer."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Approve & Unsuspend", emoji="✅", style=discord.ButtonStyle.success, custom_id="appeal:approve")
+    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_admin_id(interaction.user.id):
+            await interaction.response.send_message("Only admins can review appeals.", ephemeral=True)
+            return
+        aid = _appeal_id_from_message(interaction.message)
+        if aid is None:
+            await interaction.response.send_message("Could not read the appeal id from this message.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        ok, msg = await resolve_appeal(aid, True, interaction.user)
+        await interaction.followup.send(embed=(create_success_embed if ok else create_error_embed)("Appeal Approved" if ok else "Could not approve", msg), ephemeral=True)
+
+    @discord.ui.button(label="Reject", emoji="❌", style=discord.ButtonStyle.danger, custom_id="appeal:reject")
+    async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_admin_id(interaction.user.id):
+            await interaction.response.send_message("Only admins can review appeals.", ephemeral=True)
+            return
+        aid = _appeal_id_from_message(interaction.message)
+        if aid is None:
+            await interaction.response.send_message("Could not read the appeal id from this message.", ephemeral=True)
+            return
+        await interaction.response.send_modal(AppealRejectModal(aid))
+
+
+@bot.command(name='appeals')
+@is_admin()
+async def appeals_command(ctx):
+    """List pending suspension appeals with Approve / Reject buttons."""
+    pending = _db_all("SELECT * FROM appeals WHERE status = 'pending' ORDER BY id LIMIT 10")
+    if not pending:
+        await ctx.send(embed=create_info_embed("No Pending Appeals", "There are no suspension appeals waiting for review."))
+        return
+    for a in pending:
+        _, vps = find_vps(a["container_name"])
+        msg = await ctx.send(embed=build_appeal_embed(a, vps), view=AppealReviewView())
+        try:
+            refs = json.loads(a.get("messages") or "[]")
+        except (TypeError, ValueError):
+            refs = []
+        refs.append([msg.channel.id, msg.id])
+        appeal_set_messages(a["id"], refs)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# !vpsstatus  —  LIVE PANEL THAT UPDATES ITSELF EVERY 60 SECONDS
+# ═══════════════════════════════════════════════════════════════════════════
+
+class StatusPanel:
+    def __init__(self, message_id: int, channel_id: int, owner_id: str, admin_view: bool, page: int = 0):
+        self.message_id = int(message_id)
+        self.channel_id = int(channel_id)
+        self.owner_id = str(owner_id)
+        self.admin_view = bool(admin_view)
+        self.page = int(page)
+
+
+LIVE_PANELS: Dict[int, StatusPanel] = {}
+
+
+def panel_save(p: StatusPanel):
+    _db_run(
+        """INSERT INTO live_panels (message_id, channel_id, owner_id, admin_view, created_ts)
+           VALUES (?, ?, ?, ?, ?) ON CONFLICT(message_id) DO UPDATE SET owner_id = excluded.owner_id""",
+        (p.message_id, p.channel_id, p.owner_id, 1 if p.admin_view else 0, int(time.time())))
+
+
+def panel_forget(message_id: int):
+    LIVE_PANELS.pop(int(message_id), None)
+    _db_run("DELETE FROM live_panels WHERE message_id = ?", (int(message_id),))
+
+
+def restore_status_panels():
+    for r in _db_all("SELECT * FROM live_panels"):
+        LIVE_PANELS[int(r["message_id"])] = StatusPanel(r["message_id"], r["channel_id"], r["owner_id"], r["admin_view"])
+    if LIVE_PANELS:
+        logger.info(f"Restored {len(LIVE_PANELS)} live VPS status panel(s)")
+
+
+async def collect_status_snapshot() -> Dict[str, Any]:
+    """One `lxc list` per node gives the real state of every container."""
+    node_ids = {int(v.get("node_id", 1)) for lst in vps_data.values() for v in lst}
+    status: Dict[tuple, str] = {}
+    down = set()
+
+    async def one(nid: int):
+        try:
+            out = await execute_lxc("", "list --format csv -c ns", node_id=nid, timeout=30)
+            if isinstance(out, str):
+                for line in out.splitlines():
+                    parts = line.strip().split(",")
+                    if len(parts) >= 2:
+                        status[(nid, parts[0].strip().lower())] = parts[1].strip().lower()
+        except Exception as e:
+            logger.debug(f"Status snapshot: node {nid} unreachable: {e}")
+            down.add(nid)
+
+    await asyncio.gather(*(one(n) for n in node_ids))
+    return {"status": status, "down": down, "nodes": {n["id"]: n["name"] for n in get_nodes()}, "stats": {}}
+
+
+def _live_state(vps: Dict[str, Any], snap: Dict[str, Any]) -> str:
+    nid = int(vps.get("node_id", 1))
+    if nid in snap["down"]:
+        return "unreachable"
+    return snap["status"].get((nid, str(vps["container_name"]).lower()), "missing")
+
+
+async def _live_stats(vps: Dict[str, Any], snap: Dict[str, Any], sem: asyncio.Semaphore):
+    key = vps["container_name"]
+    if key in snap["stats"]:
+        return snap["stats"][key]
+    async with sem:
+        try:
+            snap["stats"][key] = await asyncio.wait_for(get_container_stats(key, vps.get("node_id", 1)), timeout=25)
+        except Exception:
+            snap["stats"][key] = None
+    return snap["stats"][key]
+
+
+def _visible_vps(panel: StatusPanel):
+    rows = []
+    for uid, lst in vps_data.items():
+        if panel.admin_view or str(uid) == panel.owner_id:
+            for v in lst:
+                rows.append((uid, v))
+    rows.sort(key=lambda r: str(r[1]["container_name"]).lower())
+    return rows
+
+
+def _format_status_line(uid, vps, state, stats, snap) -> str:
+    name = vps["container_name"]
+    node = snap["nodes"].get(int(vps.get("node_id", 1)), "?")
+    if vps.get("suspended"):
+        icon, tail = "⛔", ["SUSPENDED"]
+    elif state == "running":
+        icon, tail = "🟢", []
+        if stats:
+            ram = stats.get("ram") if isinstance(stats.get("ram"), dict) else {}
+            cpu = stats.get("cpu")
+            tail.append(f"CPU {cpu:.1f}%" if isinstance(cpu, (int, float)) else "CPU ?")
+            tail.append(f"RAM {ram.get('used', '?')}/{ram.get('total', '?')}MB")
+            tail.append(f"⏱ {stats.get('uptime', '?')}")
+    elif state == "stopped":
+        icon, tail = "🔴", ["STOPPED"]
+    else:
+        icon, tail = "⚪", [state.upper()]
+    exp = ""
+    if vps.get("expiration_date"):
+        try:
+            days = (datetime.fromisoformat(vps["expiration_date"]) - datetime.now()).days
+            exp = "⏰ EXPIRED" if days < 0 else f"⏰ {days}d"
+        except ValueError:
+            pass
+    parts = [f"{icon} **{name}**", f"<@{uid}>", node] + tail + ([exp] if exp else [])
+    return " • ".join(parts)
+
+
+async def build_status_embed(panel: StatusPanel, snap: Dict[str, Any]) -> discord.Embed:
+    rows = _visible_vps(panel)
+    total = len(rows)
+    pages = max(1, math.ceil(total / STATUS_PAGE_SIZE))
+    panel.page = max(0, min(panel.page, pages - 1))
+
+    states = {}
+    counts = {"running": 0, "stopped": 0, "suspended": 0, "other": 0, "expiring": 0}
+    for uid, v in rows:
+        st = _live_state(v, snap)
+        states[v["container_name"]] = st
+        if st in ("running", "stopped"):
+            v["status"] = st                      # keep the in-memory copy fresh
+        if v.get("suspended"):
+            counts["suspended"] += 1
+        elif st == "running":
+            counts["running"] += 1
+        elif st == "stopped":
+            counts["stopped"] += 1
+        else:
+            counts["other"] += 1
+        if v.get("expiration_date"):
+            try:
+                d = (datetime.fromisoformat(v["expiration_date"]) - datetime.now()).days
+                if d <= EXPIRATION_WARNING_DAYS:
+                    counts["expiring"] += 1
+            except ValueError:
+                pass
+
+    page_rows = rows[panel.page * STATUS_PAGE_SIZE:(panel.page + 1) * STATUS_PAGE_SIZE]
+    sem = asyncio.Semaphore(6)
+    need = [(uid, v) for uid, v in page_rows if states[v["container_name"]] == "running" and not v.get("suspended")]
+    await asyncio.gather(*(_live_stats(v, snap, sem) for _, v in need))
+
+    lines = [_format_status_line(uid, v, states[v["container_name"]], snap["stats"].get(v["container_name"]), snap) for uid, v in page_rows]
+    summary = (f"🟢 **{counts['running']}** running • 🔴 **{counts['stopped']}** stopped • "
+               f"⛔ **{counts['suspended']}** suspended • ⏰ **{counts['expiring']}** expiring"
+               + (f" • ⚪ **{counts['other']}** unknown" if counts["other"] else ""))
+    desc = f"{summary}\n**{total}** VPS • updated <t:{int(time.time())}:R>\n\n" + ("\n".join(lines) if lines else "_No VPS to show._")
+    embed = discord.Embed(
+        title="📡 VPS Live Status — " + ("All VPS" if panel.admin_view else "Your VPS"),
+        description=truncate_text(desc, 4000), color=COLOR_INFO)
+    embed.set_footer(text=f"Page {panel.page + 1}/{pages} • auto-updates every {VPSSTATUS_INTERVAL}s • Made by AashirwadGamerzz")
+    return embed
+
+
+async def refresh_panel(panel: StatusPanel, snap: Optional[Dict[str, Any]] = None) -> bool:
+    """Edit the panel message. Returns False when the panel is gone (and forgets it)."""
+    try:
+        if snap is None:
+            snap = await collect_status_snapshot()
+        embed = await build_status_embed(panel, snap)
+        ch = bot.get_channel(panel.channel_id) or await bot.fetch_channel(panel.channel_id)
+        await ch.get_partial_message(panel.message_id).edit(embed=embed)
+        return True
+    except (discord.NotFound, discord.Forbidden):
+        panel_forget(panel.message_id)
+        return False
+    except Exception as e:
+        logger.warning(f"Live status refresh failed for message {panel.message_id}: {e}")
+        return True
+
+
+async def stop_panel(panel: StatusPanel, announce: bool = True):
+    panel_forget(panel.message_id)
+    if announce:
+        try:
+            ch = bot.get_channel(panel.channel_id) or await bot.fetch_channel(panel.channel_id)
+            await ch.get_partial_message(panel.message_id).edit(
+                embed=create_info_embed("⏹ Live status stopped", f"Run `{PREFIX}vpsstatus` to start a new live panel."), view=None)
+        except Exception:
+            pass
+
+
+async def vps_status_loop():
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            if LIVE_PANELS:
+                snap = await collect_status_snapshot()
+                for panel in list(LIVE_PANELS.values()):
+                    await refresh_panel(panel, snap)
+            await asyncio.sleep(VPSSTATUS_INTERVAL)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"VPS status loop error: {e}", exc_info=True)
+            await asyncio.sleep(VPSSTATUS_INTERVAL)
+
+
+class StatusPanelView(discord.ui.View):
+    """Persistent controls for live status panels (work again after a bot restart)."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def _panel_for(self, interaction: discord.Interaction) -> Optional[StatusPanel]:
+        panel = LIVE_PANELS.get(interaction.message.id)
+        if not panel:
+            await interaction.response.send_message("This live panel is no longer active. Run the command again.", ephemeral=True)
+            return None
+        if str(interaction.user.id) != panel.owner_id and not is_admin_id(interaction.user.id):
+            await interaction.response.send_message("Only the person who opened this panel (or an admin) can use it.", ephemeral=True)
+            return None
+        return panel
+
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary, custom_id="vpsstatus:prev")
+    async def prev_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        panel = await self._panel_for(interaction)
+        if panel:
+            await interaction.response.defer()
+            panel.page = max(0, panel.page - 1)
+            await refresh_panel(panel)
+
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary, custom_id="vpsstatus:next")
+    async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        panel = await self._panel_for(interaction)
+        if panel:
+            await interaction.response.defer()
+            panel.page += 1                      # clamped when rendering
+            await refresh_panel(panel)
+
+    @discord.ui.button(label="🔄 Refresh now", style=discord.ButtonStyle.primary, custom_id="vpsstatus:refresh")
+    async def refresh_now(self, interaction: discord.Interaction, button: discord.ui.Button):
+        panel = await self._panel_for(interaction)
+        if panel:
+            await interaction.response.defer()
+            await refresh_panel(panel)
+
+    @discord.ui.button(label="⏹ Stop", style=discord.ButtonStyle.danger, custom_id="vpsstatus:stop")
+    async def stop_live(self, interaction: discord.Interaction, button: discord.ui.Button):
+        panel = await self._panel_for(interaction)
+        if panel:
+            await interaction.response.defer()
+            await stop_panel(panel)
+
+
+@bot.command(name='vpsstatus', aliases=['vps-status'])
+async def vpsstatus_command(ctx):
+    """Live VPS panel, refreshed every 60 seconds. Admins see every VPS, users see their own."""
+    admin = is_admin_id(ctx.author.id)
+    if not admin:
+        allowed, message = check_rate_limit(ctx.author.id)
+        if not allowed:
+            await ctx.send(embed=create_error_embed("Rate Limited", message), delete_after=5)
+            return
+        if not vps_data.get(str(ctx.author.id)):
+            await ctx.send(embed=create_error_embed("No VPS Found", "You don't have any VPS to show."))
+            return
+    for p in list(LIVE_PANELS.values()):          # one panel per person per channel
+        if p.channel_id == ctx.channel.id and p.owner_id == str(ctx.author.id):
+            await stop_panel(p)
+    msg = await ctx.send(embed=create_info_embed("📡 VPS Live Status", "Collecting live data…"), view=StatusPanelView())
+    panel = StatusPanel(msg.id, ctx.channel.id, str(ctx.author.id), admin)
+    LIVE_PANELS[msg.id] = panel
+    panel_save(panel)
+    await refresh_panel(panel)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 🛒 INSTALLER SHOP
+# ═══════════════════════════════════════════════════════════════════════════
+
+SHOP_COLOR = 0xF1C40F
+SHOP_PAGE_SIZE = 5
+_INSTALLER_URL_RE = re.compile(r"^https?://[^\s]{4,}$")
+_CATEGORY_EMOJI = (
+    ("docker", "🐳"), ("panel", "🖥️"), ("game", "🎮"), ("minecraft", "⛏️"), ("web", "🌐"), ("database", "🗄️"),
+    ("db", "🗄️"), ("tool", "🛠️"), ("security", "🔒"), ("bot", "🤖"), ("dev", "💻"), ("monitor", "📈"),
+)
+
+
+def category_emoji(category: str) -> str:
+    c = (category or "").lower()
+    for key, emoji in _CATEGORY_EMOJI:
+        if key in c:
+            return emoji
+    return "📦"
+
+
+def installer_list() -> List[Dict]:
+    return _db_all("SELECT * FROM installers ORDER BY lower(category), lower(name)")
+
+
+def installer_get(installer_id: int):
+    return _db_one("SELECT * FROM installers WHERE id = ?", (int(installer_id),))
+
+
+def installer_save(installer_id: Optional[int], name, url, description, category, version, admin_id) -> int:
+    now = int(time.time())
+    if installer_id is None:
+        return _db_run(
+            """INSERT INTO installers (name, url, description, category, version, added_by, created_ts, updated_ts)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (name, url, description, category, version, str(admin_id), now, now))[0]
+    _db_run("UPDATE installers SET name = ?, url = ?, description = ?, category = ?, version = ?, updated_ts = ? WHERE id = ?",
+            (name, url, description, category, version, now, int(installer_id)))
+    return int(installer_id)
+
+
+def installer_delete(installer_id: int):
+    _db_run("DELETE FROM installers WHERE id = ?", (int(installer_id),))
+
+
+def installer_run_hint(url: str) -> Optional[str]:
+    """Shell one-liner for script installers; other link types are just downloaded."""
+    path = url.split("?", 1)[0].split("#", 1)[0].lower()
+    return f"curl -fsSL {url} | bash" if path.endswith(".sh") else None
+
+
+class InstallerModal(discord.ui.Modal):
+    """Used for both ➕ Add and ✏️ Edit (pre-filled)."""
+
+    def __init__(self, parent: "InstallerShopView", existing: Optional[Dict] = None):
+        super().__init__(title="Edit installer" if existing else "Add installer", timeout=600)
+        self.parent = parent
+        self.existing = existing
+        e = existing or {}
+        TI = discord.ui.TextInput
+        self.f_name = TI(label="Name", placeholder="e.g. Docker Engine", max_length=40, required=True, default=e.get("name"))
+        self.f_url = TI(label="Installer link (https://…)", placeholder="https://example.com/install.sh", max_length=480, required=True, default=e.get("url"))
+        self.f_desc = TI(label="Description", style=discord.TextStyle.paragraph, max_length=300, required=True, default=e.get("description"))
+        self.f_cat = TI(label="Category", placeholder="Tools, Games, Web, Database…", max_length=20, required=False, default=e.get("category") or "General")
+        self.f_ver = TI(label="Version (optional)", placeholder="1.0", max_length=15, required=False, default=e.get("version"))
+        for f in (self.f_name, self.f_url, self.f_desc, self.f_cat, self.f_ver):
+            self.add_item(f)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not is_admin_id(interaction.user.id):
+            await interaction.response.send_message("Only admins can manage the shop.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        name = self.f_name.value.strip()
+        url = self.f_url.value.strip()
+        if not _INSTALLER_URL_RE.match(url):
+            await interaction.followup.send(embed=create_error_embed("Invalid link", "The installer link must start with `http://` or `https://`."), ephemeral=True)
+            return
+        try:
+            iid = installer_save(self.existing["id"] if self.existing else None, name, url, self.f_desc.value.strip(),
+                                 (self.f_cat.value or "General").strip() or "General", (self.f_ver.value or "").strip(), interaction.user.id)
+        except sqlite3.IntegrityError:
+            await interaction.followup.send(embed=create_error_embed("Name already used", f"An installer called `{name}` already exists."), ephemeral=True)
+            return
+        self.parent.selected_id = iid
+        verb = "updated" if self.existing else "added"
+        await interaction.followup.send(embed=create_success_embed(f"Installer {verb}", f"**{name}** was {verb}."), ephemeral=True)
+        await self.parent.refresh_message()
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        logger.error(f"InstallerModal error: {error}", exc_info=True)
+
+
+class InstallerRemoveConfirm(discord.ui.View):
+    def __init__(self, parent: "InstallerShopView", item: Dict):
+        super().__init__(timeout=60)
+        self.parent = parent
+        self.item = item
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not is_admin_id(interaction.user.id):
+            await interaction.response.send_message("Only admins can manage the shop.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Yes, remove", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        installer_delete(self.item["id"])
+        if self.parent.selected_id == self.item["id"]:
+            self.parent.selected_id = None
+        await interaction.response.edit_message(embed=create_success_embed("Removed", f"**{self.item['name']}** was removed from the shop."), view=None)
+        self.stop()
+        await self.parent.refresh_message()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(embed=create_info_embed("Cancelled", "Nothing was removed."), view=None)
+        self.stop()
+
+
+class InstallerShopView(discord.ui.View):
+    """Store front: pick an installer, click Download. Admins also get Add / Edit / Remove."""
+
+    def __init__(self, opener_id: int):
+        super().__init__(timeout=840)
+        self.opener_id = int(opener_id)
+        self.items: List[Dict] = []
+        self.page = 0
+        self.category = "All"
+        self.selected_id: Optional[int] = None
+        self.message = None
+        self.reload()
+
+    # ---- data ----
+    def reload(self):
+        self.items = installer_list()
+        if self.category != "All" and not any(i["category"] == self.category for i in self.items):
+            self.category = "All"
+        if self.selected_id and not any(i["id"] == self.selected_id for i in self.items):
+            self.selected_id = None
+        self.page = max(0, min(self.page, self._pages() - 1))
+        self._rebuild()
+
+    def _filtered(self) -> List[Dict]:
+        return [i for i in self.items if self.category == "All" or i["category"] == self.category]
+
+    def _pages(self) -> int:
+        return max(1, math.ceil(len(self._filtered()) / SHOP_PAGE_SIZE))
+
+    def _page_items(self) -> List[Dict]:
+        f = self._filtered()
+        return f[self.page * SHOP_PAGE_SIZE:(self.page + 1) * SHOP_PAGE_SIZE]
+
+    def _selected(self) -> Optional[Dict]:
+        return next((i for i in self.items if i["id"] == self.selected_id), None)
+
+    # ---- rendering ----
+    def build_embed(self) -> discord.Embed:
+        embed = discord.Embed(
+            title=f"🛒 {BOT_NAME} Installer Shop",
+            description="```\n╔══════════════════════════════╗\n║   ✨  ONE-CLICK INSTALLERS  ✨   ║\n╚══════════════════════════════╝\n```",
+            color=SHOP_COLOR)
+        shown = self._page_items()
+        if not shown:
+            embed.description += "\n🛍️ **The shelves are empty right now.**\nCheck back soon — new installers are added by the admins!"
+        else:
+            cards = []
+            for i in shown:
+                mark = "▶ " if i["id"] == self.selected_id else ""
+                ver = f" `v{i['version']}`" if i["version"] else ""
+                cards.append(
+                    f"{mark}{category_emoji(i['category'])} **{i['name']}**{ver}  ·  `{i['category']}`\n"
+                    f"> {truncate_text(i['description'], 250)}\n"
+                    f"> [⬇️ Download installer]({i['url']})")
+            embed.description += "\n" + "\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n".join(cards)
+        sel = self._selected()
+        if sel:
+            hint = installer_run_hint(sel["url"])
+            value = f"[⬇️ Click here to download]({sel['url']})\n```{sel['url']}```"
+            if hint:
+                value += f"Run it inside your VPS:\n```bash\n{hint}\n```"
+            embed.add_field(name=f"🎯 {sel['name']}", value=truncate_text(value, 1000), inline=False)
+        embed.set_thumbnail(url=BOT_THUMBNAIL_URL)
+        cat = "" if self.category == "All" else f" • Category: {self.category}"
+        embed.set_footer(text=f"Page {self.page + 1}/{self._pages()} • {len(self._filtered())} installers{cat} • Made by AashirwadGamerzz")
+        return embed
+
+    def _rebuild(self):
+        self.clear_items()
+        shown = self._page_items()
+        if shown:
+            opts = [discord.SelectOption(
+                label=i["name"][:100], value=str(i["id"]),
+                description=(f"{i['category']} • v{i['version']}" if i["version"] else i["category"])[:100],
+                emoji=category_emoji(i["category"]), default=(i["id"] == self.selected_id)) for i in shown]
+            s = discord.ui.Select(placeholder="🛍️ Pick an installer…", options=opts, row=0)
+            s.callback = self._on_pick
+            self.add_item(s)
+        cats = sorted({i["category"] for i in self.items})
+        if len(cats) > 1:
+            copts = [discord.SelectOption(label="All categories", value="All", emoji="🗂️", default=self.category == "All")]
+            copts += [discord.SelectOption(label=c[:100], value=c, emoji=category_emoji(c), default=self.category == c) for c in cats[:24]]
+            cs = discord.ui.Select(placeholder="Filter by category", options=copts, row=1)
+            cs.callback = self._on_category
+            self.add_item(cs)
+        S = discord.ButtonStyle
+        prev_b = discord.ui.Button(label="◀", style=S.secondary, row=2, disabled=self.page <= 0)
+        prev_b.callback = self._on_prev
+        next_b = discord.ui.Button(label="▶", style=S.secondary, row=2, disabled=self.page >= self._pages() - 1)
+        next_b.callback = self._on_next
+        ref_b = discord.ui.Button(label="🔄", style=S.secondary, row=2)
+        ref_b.callback = self._on_refresh
+        self.add_item(prev_b); self.add_item(next_b); self.add_item(ref_b)
+        sel = self._selected()
+        if sel:
+            self.add_item(discord.ui.Button(label="Download installer", emoji="⬇️", style=S.link, url=sel["url"], row=2))
+        close_b = discord.ui.Button(label="✖", style=S.secondary, row=2)
+        close_b.callback = self._on_close
+        self.add_item(close_b)
+        if is_admin_id(self.opener_id):
+            add_b = discord.ui.Button(label="➕ Add", style=S.success, row=3)
+            add_b.callback = self._on_add
+            edit_b = discord.ui.Button(label="✏️ Edit", style=S.primary, row=3, disabled=sel is None)
+            edit_b.callback = self._on_edit
+            rem_b = discord.ui.Button(label="🗑️ Remove", style=S.danger, row=3, disabled=sel is None)
+            rem_b.callback = self._on_remove
+            self.add_item(add_b); self.add_item(edit_b); self.add_item(rem_b)
+
+    async def refresh_message(self):
+        self.reload()
+        if self.message:
+            try:
+                await self.message.edit(embed=self.build_embed(), view=self)
+            except discord.HTTPException:
+                pass
+
+    async def start_followup(self, interaction: discord.Interaction):
+        """`interaction` must already be deferred (ephemeral)."""
+        self.message = await interaction.followup.send(embed=self.build_embed(), view=self, ephemeral=True, wait=True)
+
+    async def on_timeout(self):
+        if self.message:
+            try:
+                await self.message.edit(view=None)
+            except Exception:
+                pass
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.opener_id:
+            await interaction.response.send_message("This shop window belongs to someone else — open your own with the shop button or `" + PREFIX + "shop`.", ephemeral=True)
+            return False
+        return True
+
+    # ---- callbacks ----
+    async def _show(self, interaction: discord.Interaction):
+        self._rebuild()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def _on_pick(self, interaction: discord.Interaction):
+        self.selected_id = int(interaction.data["values"][0])
+        await self._show(interaction)
+
+    async def _on_category(self, interaction: discord.Interaction):
+        self.category = interaction.data["values"][0]
+        self.page, self.selected_id = 0, None
+        await self._show(interaction)
+
+    async def _on_prev(self, interaction: discord.Interaction):
+        self.page = max(0, self.page - 1)
+        await self._show(interaction)
+
+    async def _on_next(self, interaction: discord.Interaction):
+        self.page = min(self._pages() - 1, self.page + 1)
+        await self._show(interaction)
+
+    async def _on_refresh(self, interaction: discord.Interaction):
+        self.reload()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def _on_close(self, interaction: discord.Interaction):
+        self.stop()
+        await interaction.response.edit_message(embed=create_info_embed("Shop closed", "Come back any time!"), view=None)
+
+    async def _admin_only(self, interaction: discord.Interaction) -> bool:
+        if not is_admin_id(interaction.user.id):
+            await interaction.response.send_message("Only admins can manage the shop.", ephemeral=True)
+            return False
+        return True
+
+    async def _on_add(self, interaction: discord.Interaction):
+        if await self._admin_only(interaction):
+            await interaction.response.send_modal(InstallerModal(self))
+
+    async def _on_edit(self, interaction: discord.Interaction):
+        if not await self._admin_only(interaction):
+            return
+        sel = self._selected()
+        if not sel:
+            await interaction.response.send_message("Select an installer first.", ephemeral=True)
+            return
+        await interaction.response.send_modal(InstallerModal(self, sel))
+
+    async def _on_remove(self, interaction: discord.Interaction):
+        if not await self._admin_only(interaction):
+            return
+        sel = self._selected()
+        if not sel:
+            await interaction.response.send_message("Select an installer first.", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            embed=create_warning_embed("Remove installer?", f"Remove **{sel['name']}** from the shop?"),
+            view=InstallerRemoveConfirm(self, sel), ephemeral=True)
+
+
+@bot.command(name='shop', aliases=['installers', 'installershop'])
+async def shop_command(ctx):
+    """Open the Installer Shop."""
+    if not is_admin_id(ctx.author.id):
+        allowed, message = check_rate_limit(ctx.author.id)
+        if not allowed:
+            await ctx.send(embed=create_error_embed("Rate Limited", message), delete_after=5)
+            return
+    view = InstallerShopView(ctx.author.id)
+    view.message = await ctx.send(embed=view.build_embed(), view=view)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# @MENTION COMMANDS (admins)
+# ═══════════════════════════════════════════════════════════════════════════
+
+@bot.check
+async def mention_commands_are_admin_only(ctx):
+    """`@Bot <command> …` works for admins with every command; everyone else keeps using the prefix."""
+    if (ctx.prefix or "").startswith("<@") and not is_admin_id(ctx.author.id):
+        raise commands.CheckFailure(f"Only admins can run commands with an @mention. Please use `{PREFIX}` instead, e.g. `{PREFIX}manage`.")
+    return True
+
+
+@bot.listen('on_message')
+async def mention_hint(message: discord.Message):
+    if message.author.bot or not bot.user:
+        return
+    if message.content.strip() in (f"<@{bot.user.id}>", f"<@!{bot.user.id}>") and is_admin_id(message.author.id):
+        await message.channel.send(embed=create_info_embed(
+            "👋 Admin mention mode",
+            f"Run any command by mentioning me, e.g. `@{bot.user.name} vpsstatus` or `@{bot.user.name} create 2 1 10 @user`.\n"
+            f"The normal `{PREFIX}` prefix works too."))
+
+
 class ManageView(discord.ui.View):
     def __init__(self, user_id, vps_list, is_shared=False, owner_id=None, is_admin=False, actual_index: Optional[int] = None):
         super().__init__(timeout=300)
@@ -4365,7 +5422,7 @@ class ManageView(discord.ui.View):
             add_field(embed, "⏰ Expiration", "No expiration date set", False)
         
         if suspended:
-            add_field(embed, "⚠️ Suspended", "This VPS is suspended. Contact an admin to unsuspend.", False)
+            add_field(embed, "⚠️ Suspended", "This VPS is suspended. Press **📨 Appeal** (or use the Quick actions dropdown) to ask the admins to review it.", False)
         if whitelisted:
             add_field(embed, "[OK] Whitelisted", "This VPS is exempt from auto-suspension.", False)
         
@@ -4383,7 +5440,78 @@ class ManageView(discord.ui.View):
         add_field(embed, "🎮 Controls", "Use the buttons below to manage your VPS", False)
         return embed
 
+    def _selected_vps(self):
+        try:
+            return self._resolve_target()
+        except Exception:
+            return None
+
+    def _build_quick_actions(self) -> discord.ui.Select:
+        """Dropdown with every action (same handlers as the buttons)."""
+        target = self._selected_vps() or {}
+        suspended = target.get('suspended', False)
+        O = discord.SelectOption
+        if suspended and not self.is_admin:
+            opts = [O(label="Live stats", value="stats", emoji="📊", description="CPU, RAM, disk and uptime")]
+            if not self.is_shared:
+                opts.append(O(label="Appeal suspension", value="appeal", emoji="📨", description="Ask the admins to review and unsuspend"))
+            opts.append(O(label="Installer Shop", value="shop", emoji="🛒", description="Browse one-click installers"))
+        else:
+            opts = [
+                O(label="Start VPS", value="start", emoji="▶️", description="Boot the VPS"),
+                O(label="Stop VPS", value="stop", emoji="⏸️", description="Shut the VPS down"),
+                O(label="Live stats", value="stats", emoji="📊", description="CPU, RAM, disk and uptime"),
+                O(label="Regenerate password", value="regen_password", emoji="🔐", description="Get a new root password"),
+                O(label="Create SSHX link", value="sshx", emoji="🔗", description="Shareable terminal with an expiry"),
+                O(label="Manage SSHX links", value="sshx_manage", emoji="🗂️", description="View or delete your SSHX links"),
+                O(label="File Manager", value="files", emoji="📁", description="Browse, upload and delete files"),
+                O(label="Installer Shop", value="shop", emoji="🛒", description="Browse one-click installers"),
+            ]
+            if not self.is_shared and not self.is_admin:
+                opts.append(O(label="Reinstall OS", value="reinstall", emoji="🔄", description="Wipe the VPS and install a fresh OS"))
+        select = discord.ui.Select(placeholder="⚙️ Quick actions — choose what to do", options=opts, row=0)
+        select.callback = self.quick_action_callback
+        return select
+
+    async def quick_action_callback(self, interaction: discord.Interaction):
+        choice = self.action_select.values[0]
+        if choice in ('start', 'stop', 'stats', 'regen_password', 'reinstall'):
+            await self.action_callback(interaction, choice)
+        elif choice == 'sshx':
+            await self.sshx_create_callback(interaction)
+        elif choice == 'sshx_manage':
+            await self.sshx_manage_callback(interaction)
+        elif choice == 'files':
+            await self.files_callback(interaction)
+        elif choice == 'shop':
+            await self.shop_callback(interaction)
+        elif choice == 'appeal':
+            await self.appeal_callback(interaction)
+
+    async def shop_callback(self, interaction: discord.Interaction):
+        if str(interaction.user.id) != self.user_id and not self.is_admin:
+            await interaction.response.send_message(embed=create_error_embed("Access Denied", "This is not your VPS!"), ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        view = InstallerShopView(interaction.user.id)
+        await view.start_followup(interaction)
+
+    async def appeal_callback(self, interaction: discord.Interaction):
+        if str(interaction.user.id) != self.user_id or self.is_shared:
+            await interaction.response.send_message(embed=create_error_embed("Access Denied", "Only the VPS owner can appeal a suspension."), ephemeral=True)
+            return
+        target = self._selected_vps()
+        if not target:
+            await interaction.response.send_message(embed=create_error_embed("No VPS Selected", "Please select a VPS first."), ephemeral=True)
+            return
+        if not target.get('suspended', False):
+            await interaction.response.send_message(embed=create_info_embed("Not Suspended", "This VPS is not suspended — no appeal needed."), ephemeral=True)
+            return
+        await interaction.response.send_modal(AppealModal(target['container_name'], interaction.user.id))
+
     def add_action_buttons(self):
+        self.action_select = self._build_quick_actions()
+        self.add_item(self.action_select)
         if not self.is_shared and not self.is_admin:
             reinstall_button = discord.ui.Button(label="🔄 Reinstall", style=discord.ButtonStyle.danger)
             reinstall_button.callback = lambda inter: self.action_callback(inter, 'reinstall')
@@ -4413,6 +5541,14 @@ class ManageView(discord.ui.View):
         self.add_item(stop_button)
         self.add_item(password_button)
         self.add_item(stats_button)
+        shop_button = discord.ui.Button(label="🛒 Installer Shop", style=discord.ButtonStyle.success)
+        shop_button.callback = self.shop_callback
+        self.add_item(shop_button)
+        _tv = self._selected_vps() or {}
+        if _tv.get('suspended', False) and not self.is_admin and not self.is_shared:
+            appeal_button = discord.ui.Button(label="📨 Appeal", style=discord.ButtonStyle.danger)
+            appeal_button.callback = self.appeal_callback
+            self.add_item(appeal_button)
 
     def _resolve_target(self):
         actual_idx = self.actual_index if self.is_shared else self.indices[self.selected_index]
@@ -4432,7 +5568,7 @@ class ManageView(discord.ui.View):
             await interaction.response.send_message(embed=create_error_embed("VPS Not Found", "This VPS no longer exists."), ephemeral=True)
             return None
         if target.get('suspended', False) and not self.is_admin:
-            await interaction.response.send_message(embed=create_error_embed("Access Denied", "This VPS is suspended. Contact an admin to unsuspend."), ephemeral=True)
+            await interaction.response.send_message(embed=create_error_embed("Access Denied", "This VPS is suspended. Use the **📨 Appeal** button to ask the admins to review it."), ephemeral=True)
             return None
         return target
 
@@ -4500,7 +5636,7 @@ class ManageView(discord.ui.View):
         target_vps = vps_data[self.owner_id][actual_idx]
         suspended = target_vps.get('suspended', False)
         if suspended and not self.is_admin and action != 'stats':
-            await interaction.followup.send(embed=create_error_embed("Access Denied", "This VPS is suspended. Contact an admin to unsuspend."), ephemeral=True)
+            await interaction.followup.send(embed=create_error_embed("Access Denied", "This VPS is suspended. Use the **📨 Appeal** button to ask the admins to review it."), ephemeral=True)
             return
         container_name = target_vps["container_name"]
         node_id = target_vps['node_id']
@@ -4913,12 +6049,12 @@ async def vps_list(ctx, node_id: int = 1):
             )
             chunk_text = "\n".join(chunk)
             add_field(page_embed, "📋 **VPS List**", f"```{chunk_text}```", False)
-            page_embed.set_footer(text=f"Made by Hopingboyz • {len(vps_info)} VPS shown")
+            page_embed.set_footer(text=f"Made by AashirwadGamerzz • {len(vps_info)} VPS shown")
             await ctx.send(embed=page_embed)
     else:
         add_field(embed, "📋 **VPS List**", "No deployments yet. Launch one! 🚀", False)
 
-    embed.set_footer(text=f"Made by Hopingboyz • Total: {len(vps_info)} VPS")
+    embed.set_footer(text=f"Made by AashirwadGamerzz • Total: {len(vps_info)} VPS")
     await ctx.send(embed=embed)
 
 @bot.command(name='list-all')
@@ -5453,6 +6589,7 @@ async def delete_vps(ctx, user: discord.Member, vps_number: int, *, reason: str 
     cur.execute("DELETE FROM vps WHERE container_name = ?", (container_name,))
     cur.execute("DELETE FROM port_forwards WHERE vps_container = ?", (container_name,))
     cur.execute("DELETE FROM sshx_sessions WHERE container_name = ?", (container_name,))
+    cur.execute("DELETE FROM appeals WHERE container_name = ?", (container_name,))
 
     conn.commit()
     conn.close()
@@ -5909,7 +7046,7 @@ async def system_status(ctx):
     add_field(embed, "🏥 System Health", health_status, False)
     
     # Footer with current time
-    embed.set_footer(text=f"Made by Hopingboyz • System Status • Updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+    embed.set_footer(text=f"Made by AashirwadGamerzz • System Status • Updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
                     icon_url=BOT_ICON_URL)
     
     await ctx.send(embed=embed)
@@ -6147,7 +7284,7 @@ async def user_info(ctx, user: discord.Member):
             inline=False
         )
 
-    embed.set_footer(text="Made by Hopingboyz • User Resource Dashboard")
+    embed.set_footer(text="Made by AashirwadGamerzz • User Resource Dashboard")
     embed.timestamp = ctx.message.created_at
 
     await ctx.send(embed=embed)
@@ -6301,7 +7438,7 @@ async def server_stats(ctx):
         inline=True
     )
 
-    embed.set_footer(text="Made by Hopingboyz • Real-Time Monitoring")
+    embed.set_footer(text="Made by AashirwadGamerzz • Real-Time Monitoring")
     embed.timestamp = ctx.message.created_at
 
     await ctx.send(embed=embed)
@@ -6343,7 +7480,7 @@ async def vps_info(ctx, container_name: str = None):
         for idx, chunk in enumerate(chunks, 1):
             embed = create_embed(f"🖥️ All VPS (Part {idx}/{len(chunks)})", f"Complete list of all VPS deployments with expiration status", 0x2ecc71)
             add_field(embed, "VPS Inventory", chunk, False)
-            embed.set_footer(text=f"Made by Hopingboyz • VPS Information System")
+            embed.set_footer(text=f"Made by AashirwadGamerzz • VPS Information System")
             await ctx.send(embed=embed)
     else:
         found_vps = None
@@ -6451,7 +7588,7 @@ async def vps_info(ctx, container_name: str = None):
         # OS information
         add_field(embed, "🐧 Operating System", f"`{found_vps.get('os_version', 'ubuntu:22.04')}`", True)
         
-        embed.set_footer(text=f"Made by Hopingboyz • VPS Information System • Container: {container_name}")
+        embed.set_footer(text=f"Made by AashirwadGamerzz • VPS Information System • Container: {container_name}")
         await ctx.send(embed=embed)
 
 @bot.command(name='restart-vps')
@@ -6868,7 +8005,7 @@ async def vps_password(ctx, container_name: str = None):
             embed = create_embed(f"🔐 VPS Root Passwords (Part {idx}/{len(chunks)})", "Root passwords for all VPS", 0xff6b6b)
             add_field(embed, "Passwords", chunk, False)
             add_field(embed, "⚠️ Security Notice", "These passwords are sensitive. Do not share them publicly.", False)
-            embed.set_footer(text=f"Made by Hopingboyz • Password Management")
+            embed.set_footer(text=f"Made by AashirwadGamerzz • Password Management")
             await ctx.send(embed=embed)
     else:
         # Show password for specific VPS
@@ -6897,7 +8034,7 @@ async def vps_password(ctx, container_name: str = None):
             add_field(embed, "🔐 Password", f"`{password}`", False)
             add_field(embed, "Usage", f"SSH as `root` with this password", False)
         
-        embed.set_footer(text=f"Made by Hopingboyz • Password Information")
+        embed.set_footer(text=f"Made by AashirwadGamerzz • Password Information")
         await ctx.send(embed=embed)
 
 @bot.command(name='suspend-vps')
@@ -6928,7 +8065,7 @@ async def suspend_vps(ctx, container_name: str, *, reason: str = "Admin action")
                     return
                 try:
                     owner = await bot.fetch_user(int(uid))
-                    embed = create_warning_embed("🚨 VPS Suspended", f"Your VPS `{container_name}` has been suspended by an admin.\n\n**Reason:** {reason}\n\nContact an admin to unsuspend.")
+                    embed = create_warning_embed("🚨 VPS Suspended", f"Your VPS `{container_name}` has been suspended by an admin.\n\n**Reason:** {reason}\n\nUse `{PREFIX}manage` and press **📨 Appeal** to ask an admin to review it.")
                     await owner.send(embed=embed)
                 except Exception as dm_e:
                     logger.error(f"Failed to DM owner {uid}: {dm_e}")
@@ -7428,7 +8565,7 @@ async def quick_help(ctx):
             f"• `{PREFIX}serverstats` - System overview\n"
             f"• `{PREFIX}suspend-vps <container> <reason>` - Suspend VPS", False)
     
-    embed.set_footer(text=f"Made by Hopingboyz • Use {PREFIX}help for complete command list")
+    embed.set_footer(text=f"Made by AashirwadGamerzz • Use {PREFIX}help for complete command list")
     await ctx.send(embed=embed)
 
 @bot.command(name='help-search')
@@ -7483,7 +8620,7 @@ async def help_search(ctx, *, search_term: str = None):
     if len(matches) > 15:
         add_field(embed, "Note", f"Showing 15 of {len(matches)} matches. Try a more specific search.", False)
     
-    embed.set_footer(text=f"Made by Hopingboyz • Use {PREFIX}help for complete list")
+    embed.set_footer(text=f"Made by AashirwadGamerzz • Use {PREFIX}help for complete list")
     await ctx.send(embed=embed)    
 
 @bot.command(name='node')
@@ -8232,4 +9369,3 @@ if __name__ == "__main__":
         logger.error(f"[ERROR] Failed to login with Discord token: {e}")
         logger.error("Please check your DISCORD_TOKEN in the .env file.")
         exit(1)
-
